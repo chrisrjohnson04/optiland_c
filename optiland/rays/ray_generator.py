@@ -31,10 +31,14 @@ class RayGenerator:
             RealRays: RealRays object containing the generated rays.
 
         """
+        field_count = be.size(Hx)
+        pupil_count = be.size(Px)
         vxf, vyf = self.optic.fields.get_vig_factor(Hx, Hy)
         vx = 1 - be.array(vxf)
+        vx_broadcasted = be.reshape(vx, (field_count, 1)) 
         vy = 1 - be.array(vyf)
-        x0, y0, z0 = self._get_ray_origins(Hx, Hy, Px, Py, vx, vy)
+        vy_broadcasted = be.reshape(vy, (field_count, 1)) 
+        x0, y0, z0 = self._get_ray_origins(Hx, Hy, Px, Py, vx_broadcasted, vy_broadcasted, field_count, pupil_count)
 
         if self.optic.obj_space_telecentric:
             if self.optic.field_type == "angle":
@@ -59,9 +63,15 @@ class RayGenerator:
             EPL = self.optic.paraxial.EPL()
             EPD = self.optic.paraxial.EPD()
 
-            x1 = Px * EPD * vx / 2
-            y1 = Py * EPD * vy / 2
-            z1 = be.full_like(Px, EPL)
+            x_broadcasted = be.broadcast_to(Px, (field_count, pupil_count)) 
+            x1 = be.reshape(vx_broadcasted * x_broadcasted, (-1,))
+            x1 = x1 * EPD * 0.5
+            # x1 = Px * EPD * vx / 2 (before chris j changes)
+            y_broadcasted = be.broadcast_to(Py, (field_count, pupil_count)) 
+            y1 = be.reshape(vy_broadcasted * y_broadcasted, (-1,))
+            y1 = y1 * EPD * 0.5
+            # y1 = Py * EPD * vy / 2 ( before chris j changes)
+            z1 = be.full_like(x1, EPL)
 
         mag = be.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2 + (z1 - z0) ** 2)
         L = (x1 - x0) / mag
@@ -70,9 +80,11 @@ class RayGenerator:
 
         apodization = self.optic.apodization
         if apodization:
-            intensity = apodization.get_intensity(Px, Py)
+            x_tiled = be.tile(Px, field_count)
+            y_tiled = be.tile(Py, field_count)
+            intensity = apodization.get_intensity(x_tiled, y_tiled)
         else:
-            intensity = be.ones_like(Px)
+            intensity = be.ones_like(x1)
 
         wavelength = be.ones_like(x1) * wavelength
 
@@ -85,16 +97,18 @@ class RayGenerator:
             return RealRays(x0, y0, z0, L, M, N, intensity, wavelength)
         return PolarizedRays(x0, y0, z0, L, M, N, intensity, wavelength)
 
-    def _get_ray_origins(self, Hx, Hy, Px, Py, vx, vy):
+    def _get_ray_origins(self, Hx, Hy, Px, Py, vx_broadcasted, vy_broadcasted, field_count, pupil_count):
         """Calculate the initial positions for rays originating at the object.
 
         Args:
-            Hx (float): Normalized x field coordinate.
-            Hy (float): Normalized y field coordinate.
+            Hx (float or be.ndarray): Normalized x field coordinate.
+            Hy (float or be.ndarray): Normalized y field coordinate.
             Px (float or be.ndarray): x-coordinate of the pupil point.
             Py (float or be.ndarray): y-coordinate of the pupil point.
-            vx (float): Vignetting factor in the x-direction.
-            vy (float): Vignetting factor in the y-direction.
+            vx (be.ndarray): Vignetting factor in the x-direction.
+            vy (be.ndarray): Vignetting factor in the y-direction.
+            field_count (float): Number of fields
+            pupil_count (float): Number of pupils
 
         Returns:
             tuple: A tuple containing the x, y, and z coordinates of the
@@ -125,30 +139,43 @@ class RayGenerator:
 
             # x, y, z positions of ray starting points
             x = -be.tan(be.radians(field_x)) * (offset + EPL)
+            x = be.repeat(x, pupil_count)
             y = -be.tan(be.radians(field_y)) * (offset + EPL)
+            y = be.repeat(y, pupil_count)
             z = self.optic.surface_group.positions[1] - offset
 
-            x0 = Px * EPD / 2 * vx + x
-            y0 = Py * EPD / 2 * vy + y
-            z0 = be.full_like(Px, z)
+            x_broadcasted = be.broadcast_to(Px, (field_count, pupil_count)) 
+            
+            x0 = be.reshape(vx_broadcasted * x_broadcasted, (-1,))
+            x0 = x0 * (EPD / 2) + x
+            # x0 = Px * EPD / 2 * vx + x (before changes by chris j)
+            y_broadcasted = be.broadcast_to(Py, (field_count, pupil_count)) 
+            y0 = be.reshape(vy_broadcasted * y_broadcasted, (-1,))
+            y0 = y0 * (EPD / 2) + y
+            # y0 = Py * EPD / 2 * vy + y (before changes by chris j)
+            z0 = be.full_like(x0, z)
         else:
             if self.optic.field_type == "object_height":
                 x0 = be.array(field_x)
+                x0 = be.repeat(x0, pupil_count)
                 y0 = be.array(field_y)
+                y0 = be.repeat(y0, pupil_count)
                 z0 = obj.geometry.sag(x0, y0) + obj.geometry.cs.z
 
             elif self.optic.field_type == "angle":
                 EPL = self.optic.paraxial.EPL()
                 z0 = self.optic.surface_group.positions[0]
                 x0 = -be.tan(be.radians(field_x)) * (EPL - z0)
+                x0 = be.repeat(x0, pupil_count)
                 y0 = -be.tan(be.radians(field_y)) * (EPL - z0)
+                y0 = be.repeat(y0, pupil_count)
 
             if be.size(x0) == 1:
-                x0 = be.full_like(Px, x0)
+                x0 = be.repeat(x0, pupil_count*field_count)
             if be.size(y0) == 1:
-                y0 = be.full_like(Px, y0)
+                y0 = be.repeat(y0, pupil_count*field_count)
             if be.size(z0) == 1:
-                z0 = be.full_like(Px, z0)
+                z0 = be.repeat(z0, pupil_count*field_count)
 
         return x0, y0, z0
 
